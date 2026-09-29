@@ -1,6 +1,6 @@
 id = "muse.resume"
 name = "Muse Resume"
-version = "0.2.0"
+version = "0.2.1"
 min_herdr_version = "0.9.0"
 description = "Resume Muse sessions in restored panes after a Herdr server restart (Codex-like behavior)"
 platforms = ["linux", "macos"]

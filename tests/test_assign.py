@@ -100,6 +100,26 @@ class AssignSessionsTest(unittest.TestCase):
                           got["w2:p1"]["session_name"]}, {"a", "b"})
 
 
+class EachWithPauseTest(unittest.TestCase):
+    def test_pauses_between_items_only(self):
+        calls = []
+        got = list(resume.each_with_pause(["a", "b", "c"], 2, calls.append))
+        self.assertEqual([item for _, item in got], ["a", "b", "c"])
+        self.assertEqual(calls, [2, 2])
+
+    def test_no_pause_for_single_item(self):
+        calls = []
+        got = list(resume.each_with_pause(["a"], 5, calls.append))
+        self.assertEqual([item for _, item in got], ["a"])
+        self.assertEqual(calls, [])
+
+    def test_non_positive_stagger_disables_pausing(self):
+        for stagger in (0, -1):
+            calls = []
+            list(resume.each_with_pause(["a", "b"], stagger, calls.append))
+            self.assertEqual(calls, [])
+
+
 class MappingFileTest(unittest.TestCase):
     def test_roundtrip_and_missing_file(self):
         with tempfile.TemporaryDirectory() as tmp:

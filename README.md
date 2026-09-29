@@ -21,7 +21,9 @@ the most recent `valid` sessions for that workspace — the same pool
 
 Panes sharing one cwd each get their own distinct session (newest first), so
 three shells in `/repo` resume the three most recent sessions for `/repo`
-instead of fighting over the newest one. Assignments persist in
+instead of fighting over the newest one. Resumes are sent a couple of
+seconds apart so several heavy TUIs don't start in the same instant.
+Assignments persist in
 `resume-state.json` next to the plugin config, so each pane gets its same
 session back on the next restart; panes whose mapped session went stale fall
 back to the newest free session.
@@ -61,6 +63,7 @@ Create `<config-dir>/config.toml` (find the dir with
 
 ```toml
 delay_seconds = 5        # wait for restored shells to reach a prompt
+stagger_seconds = 2      # pause between resumes (0 disables)
 ignore_cwds = ["/tmp"]   # never resume under these paths
 only_cwds = []           # if non-empty, resume only under these paths
 dry_run = false          # log actions without running them

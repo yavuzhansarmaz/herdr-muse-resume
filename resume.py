@@ -11,7 +11,8 @@ panes come back as plain shells. This hook closes that gap:
      recent valid Muse sessions from Muse's session-index.db (newest first)
      and give every pane its own distinct session, so N panes sharing one
      cwd resume N different sessions instead of fighting over the newest.
-  4. Run `muse resume <session-id>` in each pane via `herdr pane run`.
+  4. Run `muse resume <session-id>` in each pane via `herdr pane run`,
+     staggered so heavy TUIs don't all start in the same instant.
 
 Stable matching: pane -> session assignments are persisted to
 resume-state.json next to the plugin config. On the next restart, a pane
@@ -25,6 +26,7 @@ Safety:
   - Panes whose cwd has no Muse history are left untouched.
   - Honors optional config at $HERDR_PLUGIN_CONFIG_DIR/config.toml:
         delay_seconds = 5        # wait for restored shells to reach a prompt
+        stagger_seconds = 2      # pause between resumes (0 disables)
         ignore_cwds = ["/tmp"]   # exact cwd prefixes to skip
         only_cwds = []           # if non-empty, resume only under these prefixes
         dry_run = false          # log actions without running them
@@ -57,6 +59,7 @@ def log(msg):
 def load_config():
     cfg = {
         "delay_seconds": 5,
+        "stagger_seconds": 2,
         "ignore_cwds": [],
         "only_cwds": [],
         "dry_run": False,
@@ -238,6 +241,18 @@ def assign_sessions(panes, fetch_sessions, mapping):
     return assignments, skips
 
 
+def each_with_pause(items, stagger, sleep):
+    """Yield (index, item), pausing before every item after the first.
+
+    Keeps N heavy agents from starting in the same instant after a
+    restore. A non-positive stagger disables pausing.
+    """
+    for index, item in enumerate(items):
+        if index and stagger > 0:
+            sleep(stagger)
+        yield index, item
+
+
 def main(argv):
     cfg = load_config()
     only_pane = None
@@ -299,24 +314,31 @@ def main(argv):
         pane = next(p for p in eligible if p["pane_id"] == pane_id)
         log(f"skip {pane_id} ({pane['cwd']}): {skips[pane_id]}")
 
-    resumed = set()
-    for pane_id in sorted(assignments):
+    def describe(pane_id):
         session = assignments[pane_id]
         pane = next(p for p in eligible if p["pane_id"] == pane_id)
-        cmd = f"muse resume {session['session_id']}"
-        if cfg["dry_run"]:
+        return session, pane, f"muse resume {session['session_id']}"
+
+    resumed = set()
+    if cfg["dry_run"]:
+        for pane_id in sorted(assignments):
+            session, pane, cmd = describe(pane_id)
             log(f"dry-run: would send to {pane_id} ({pane['cwd']}): {cmd}")
             resumed.add(session["session_id"])
-            continue
-        try:
-            herdr("pane", "run", pane_id, cmd, expect_json=False)
-        except Exception as exc:
-            log(f"ERROR: cannot resume in {pane_id}: {exc}")
-            continue
-        resumed.add(session["session_id"])
-        mapping[pane_id] = session["session_id"]
-        log(f"resumed {pane_id} ({pane['cwd']}): {cmd} "
-            f"[{session['session_name']}, {session['prompt_count']} prompts]")
+    else:
+        stagger = max(0, cfg["stagger_seconds"])
+        plan = each_with_pause(sorted(assignments), stagger, time.sleep)
+        for _, pane_id in plan:
+            session, pane, cmd = describe(pane_id)
+            try:
+                herdr("pane", "run", pane_id, cmd, expect_json=False)
+            except Exception as exc:
+                log(f"ERROR: cannot resume in {pane_id}: {exc}")
+                continue
+            resumed.add(session["session_id"])
+            mapping[pane_id] = session["session_id"]
+            log(f"resumed {pane_id} ({pane['cwd']}): {cmd} "
+                f"[{session['session_name']}, {session['prompt_count']} prompts]")
 
     if not cfg["dry_run"]:
         # Drop mappings for panes that no longer exist; keep the rest so
