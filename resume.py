@@ -7,14 +7,21 @@ panes come back as plain shells. This hook closes that gap:
 
   1. After Herdr restores the session, list all panes.
   2. Skip panes that already run something (agent != null).
-  3. For each plain-shell pane, look up the most recent valid Muse session
-     for that pane's cwd in Muse's session-index.db.
-  4. Run `muse resume <session-id>` in the pane via `herdr pane run`.
+  3. Group the remaining plain-shell panes by cwd. For each cwd, fetch the
+     recent valid Muse sessions from Muse's session-index.db (newest first)
+     and give every pane its own distinct session, so N panes sharing one
+     cwd resume N different sessions instead of fighting over the newest.
+  4. Run `muse resume <session-id>` in each pane via `herdr pane run`.
+
+Stable matching: pane -> session assignments are persisted to
+resume-state.json next to the plugin config. On the next restart, a pane
+whose mapped session is still valid for its cwd gets that same session
+back; unknown or stale panes fall back to the newest free session. Pane
+ids are Herdr's stable per-pane numbers, so each space keeps its session.
 
 Safety:
   - Read-only access to Muse's session index (never modifies sessions).
-  - Each Muse session is resumed at most once per run (dedup by session id),
-    so two panes sharing one cwd don't attach to the same session twice.
+  - Each Muse session is resumed at most once per run (dedup by session id).
   - Panes whose cwd has no Muse history are left untouched.
   - Honors optional config at $HERDR_PLUGIN_CONFIG_DIR/config.toml:
         delay_seconds = 5        # wait for restored shells to reach a prompt
@@ -37,6 +44,10 @@ try:
     import tomllib
 except ModuleNotFoundError:  # Python < 3.11
     tomllib = None
+
+STATE_FILENAME = "resume-state.json"
+# Candidates fetched per cwd; comfortably above any realistic pane count.
+SESSIONS_PER_CWD = 50
 
 
 def log(msg):
@@ -94,47 +105,50 @@ def norm(path):
         return path
 
 
-def latest_muse_session(cwd):
-    """Most recent valid Muse session for cwd, or None.
-
-    Mirrors `muse resume --last` workspace scoping: exact workspace match,
-    newest first. Read-only; an empty/missing index simply yields None.
-    """
+def find_session_db():
     data_home = os.environ.get("XDG_DATA_HOME") or "~/.local/share"
-    candidates_db = [
+    candidates = [
         os.path.expanduser(os.path.join(data_home, "muse/session-index.db")),
         os.path.expanduser("~/.local/share/muse/session-index.db"),
         os.path.expanduser(
             "~/Library/Application Support/muse/session-index.db"
         ),
     ]
-    db_path = next(
-        (p for p in candidates_db if os.path.isfile(p)), None
-    )
+    return next((p for p in candidates if os.path.isfile(p)), None)
+
+
+def recent_muse_sessions(cwd, limit=SESSIONS_PER_CWD):
+    """Recent valid Muse sessions for cwd, newest first. Read-only.
+
+    Mirrors `muse resume --last` workspace scoping (exact workspace match),
+    but returns a list so panes sharing one cwd can each take a distinct
+    session. An empty/missing index simply yields [].
+    """
+    db_path = find_session_db()
     if db_path is None:
-        return None
+        return []
     candidates = {cwd, norm(cwd)}
     try:
         db = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         try:
             placeholders = ",".join("?" for _ in candidates)
-            row = db.execute(
+            rows = db.execute(
                 f"""SELECT session_id, session_name, prompt_count
                     FROM sessions
                     WHERE status = 'valid'
                       AND workspace_root IN ({placeholders})
-                    ORDER BY updated_at_us DESC LIMIT 1""",
-                sorted(candidates),
-            ).fetchone()
+                    ORDER BY updated_at_us DESC LIMIT ?""",
+                [*sorted(candidates), max(1, limit)],
+            ).fetchall()
         finally:
             db.close()
     except Exception as exc:
         log(f"WARNING: could not query muse session index: {exc}")
-        return None
-    if not row:
-        return None
-    return {"session_id": row[0], "session_name": row[1],
-            "prompt_count": row[2]}
+        return []
+    return [
+        {"session_id": r[0], "session_name": r[1], "prompt_count": r[2]}
+        for r in rows
+    ]
 
 
 def under(path, prefixes):
@@ -143,6 +157,85 @@ def under(path, prefixes):
         path == norm(prefix) or path.startswith(norm(prefix).rstrip("/") + "/")
         for prefix in prefixes
     )
+
+
+def state_path():
+    """Where pane -> session assignments persist across restarts."""
+    config_dir = os.environ.get("HERDR_PLUGIN_CONFIG_DIR", "")
+    if config_dir:
+        return os.path.join(config_dir, STATE_FILENAME)
+    data_home = os.environ.get("XDG_DATA_HOME") or "~/.local/share"
+    return os.path.expanduser(
+        os.path.join(data_home, "herdr-muse-resume", STATE_FILENAME)
+    )
+
+
+def load_mapping(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        mapping = data.get("panes", {}) if isinstance(data, dict) else {}
+        return {k: v for k, v in mapping.items() if isinstance(v, str)}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_mapping(path, mapping):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"panes": mapping}, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def assign_sessions(panes, fetch_sessions, mapping):
+    """Assign each eligible pane a distinct session.
+
+    panes: [{"pane_id":..., "cwd":...}], already filtered to resume targets.
+    fetch_sessions: cwd -> [session dicts newest first].
+    mapping: pane_id -> session_id remembered from a previous run.
+
+    Returns (assignments, skips): assignments maps pane_id -> session dict,
+    skips maps pane_id -> human-readable reason.
+    """
+    assignments = {}
+    skips = {}
+    taken = set()
+    groups = {}
+    for pane in panes:
+        groups.setdefault(norm(pane["cwd"]), []).append(pane)
+    for cwd_norm in sorted(groups):
+        group = sorted(groups[cwd_norm], key=lambda p: p["pane_id"])
+        sessions = [s for s in fetch_sessions(group[0]["cwd"])
+                    if s["session_id"] not in taken]
+        if not sessions:
+            for pane in group:
+                skips[pane["pane_id"]] = "no muse history here"
+            continue
+        by_id = {s["session_id"]: s for s in sessions}
+        # Pass 1: keep stable pane -> session matches from previous runs.
+        pending = []
+        for pane in group:
+            wanted = mapping.get(pane["pane_id"])
+            if wanted and wanted in by_id and wanted not in taken:
+                assignments[pane["pane_id"]] = by_id[wanted]
+                taken.add(wanted)
+            else:
+                pending.append(pane)
+        # Pass 2: newest free session for the rest, in pane-id order.
+        free = [s for s in sessions if s["session_id"] not in taken]
+        for pane, session in zip(pending, free):
+            assignments[pane["pane_id"]] = session
+            taken.add(session["session_id"])
+        for pane in pending[len(free):]:
+            skips[pane["pane_id"]] = (
+                f"only {len(sessions)} muse session(s) for this cwd, "
+                f"all already assigned"
+            )
+    return assignments, skips
 
 
 def main(argv):
@@ -172,7 +265,8 @@ def main(argv):
         return 1
     log(f"found {len(panes)} pane(s)")
 
-    resumed = set()
+    mapping = load_mapping(state_path())
+    eligible = []
     for pane in panes:
         pane_id = pane.get("pane_id", "?")
         cwd = pane.get("cwd") or ""
@@ -190,17 +284,28 @@ def main(argv):
         if cfg["only_cwds"] and not under(cwd, cfg["only_cwds"]):
             log(f"skip {pane_id} ({cwd}): not under only_cwds")
             continue
-        session = latest_muse_session(cwd)
-        if not session:
-            log(f"skip {pane_id} ({cwd}): no muse history here")
-            continue
-        if session["session_id"] in resumed:
-            log(f"skip {pane_id} ({cwd}): session "
-                f"{session['session_name']} already resumed this run")
-            continue
+        eligible.append({"pane_id": pane_id, "cwd": cwd})
+
+    if not eligible:
+        log("done, resumed 0 pane(s)")
+        return 0
+
+    def fetch(cwd):
+        need = sum(1 for p in eligible if norm(p["cwd"]) == norm(cwd))
+        return recent_muse_sessions(cwd, limit=max(SESSIONS_PER_CWD, need))
+
+    assignments, skips = assign_sessions(eligible, fetch, mapping)
+    for pane_id in sorted(skips):
+        pane = next(p for p in eligible if p["pane_id"] == pane_id)
+        log(f"skip {pane_id} ({pane['cwd']}): {skips[pane_id]}")
+
+    resumed = set()
+    for pane_id in sorted(assignments):
+        session = assignments[pane_id]
+        pane = next(p for p in eligible if p["pane_id"] == pane_id)
         cmd = f"muse resume {session['session_id']}"
         if cfg["dry_run"]:
-            log(f"dry-run: would send to {pane_id} ({cwd}): {cmd}")
+            log(f"dry-run: would send to {pane_id} ({pane['cwd']}): {cmd}")
             resumed.add(session["session_id"])
             continue
         try:
@@ -209,8 +314,18 @@ def main(argv):
             log(f"ERROR: cannot resume in {pane_id}: {exc}")
             continue
         resumed.add(session["session_id"])
-        log(f"resumed {pane_id} ({cwd}): {cmd} "
+        mapping[pane_id] = session["session_id"]
+        log(f"resumed {pane_id} ({pane['cwd']}): {cmd} "
             f"[{session['session_name']}, {session['prompt_count']} prompts]")
+
+    if not cfg["dry_run"]:
+        # Drop mappings for panes that no longer exist; keep the rest so
+        # panes skipped this run (e.g. already running) stay stable.
+        live = {p.get("pane_id") for p in panes if p.get("pane_id")}
+        if only_pane:
+            live |= set(mapping)
+        save_mapping(state_path(), {k: v for k, v in mapping.items()
+                                    if k in live})
 
     log(f"done, resumed {len(resumed)} pane(s)")
     return 0
