@@ -37,7 +37,9 @@ Automatically skipped:
 
 ## Install
 
-Requires Herdr 0.9+ and `python3` (stdlib only, no dependencies):
+Requires Herdr 0.9+ and a Rust toolchain (`cargo`) at install time — Herdr
+builds the plugin from source. No runtime dependencies (single static
+binary, SQLite bundled):
 
 ```bash
 herdr plugin install yavuzhansarmaz/herdr-muse-resume
@@ -76,8 +78,12 @@ from newest to oldest.
 ## Compatibility
 
 Tested on Linux with Herdr 0.9.1 and Muse 1.4.0. macOS is declared and the
-code is portable (bash + python3 stdlib), but not yet verified there —
+code is portable (Rust + bundled SQLite), but not yet verified there —
 reports welcome.
+
+v0.3.0 is a Rust rewrite of the original stdlib-only Python hook (v0.2.x):
+same CLI, config keys, `resume-state.json` format, and log lines. Existing
+config and state files carry over untouched.
 
 ## Relation to herdr-muse
 
@@ -89,15 +95,16 @@ together.
 
 ## How it is tested
 
-`resume.py` supports `--dry-run` and `--pane <id>` for safe manual runs, and
-`tests/` holds stdlib-only regression tests
-(`python3 -m unittest discover -s tests -t .`).
-End-to-end verified with an isolated named Herdr session: two workspaces
-created (one cwd with Muse history, one without), server stopped and
-restarted — the hook resumed Muse in the first pane and left the second as a
-plain shell. Multi-pane sharing one cwd is covered by the assignment tests
-plus a read-only check against a real `session-index.db` (three panes in one
-cwd resolve to three distinct sessions). See the script header for details.
+The binary supports `--dry-run` and `--pane <id>` for safe manual runs, and
+`cargo test` runs the regression suite (assignment, stagger, state-file
+roundtrip). End-to-end verified with an isolated named Herdr session: two
+workspaces created (one cwd with Muse history, one without), server stopped
+and restarted — the hook resumed Muse in the first pane and left the second
+as a plain shell. Multi-pane sharing one cwd is covered by the assignment
+tests plus a read-only check against a real `session-index.db` (three panes
+in one cwd resolve to three distinct sessions). Rust/Python output parity is
+checked with a canned `herdr api snapshot` (see the module docs in
+`src/main.rs` for details).
 
 ## License
 
