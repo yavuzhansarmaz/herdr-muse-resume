@@ -1,6 +1,6 @@
 [package]
 name = "herdr-muse-resume"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "Resume Muse sessions in restored Herdr panes after a server restart (Codex-like behavior)"
 

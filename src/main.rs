@@ -11,7 +11,9 @@
 //!      and give every pane its own distinct session, so N panes sharing one
 //!      cwd resume N different sessions instead of fighting over the newest.
 //!   4. Run `muse resume <session-id>` in each pane via `herdr pane run`,
-//!      staggered so heavy TUIs don't all start in the same instant.
+//!      waiting first for each shell to settle at a prompt (bounded by
+//!      delay_seconds) and staggered so heavy TUIs don't all start in the
+//!      same instant.
 //!
 //! Stable matching: pane -> session assignments are persisted to
 //! resume-state.json next to the plugin config. On the next restart, a pane
@@ -25,7 +27,9 @@
 //!   - Panes whose cwd has no Muse history are left untouched.
 //!   - Honors optional config at $HERDR_PLUGIN_CONFIG_DIR/config.toml:
 //!     ```toml
-//!     delay_seconds = 5        # wait for restored shells to reach a prompt
+//!     delay_seconds = 10       # max wait per pane for its shell to settle
+//!                              # at a prompt (adaptive: proceeds as soon as
+//!                              # pane output is stable; 0 disables waiting)
 //!     stagger_seconds = 2      # pause between resumes (0 disables)
 //!     ignore_cwds = ["/tmp"]   # exact cwd prefixes to skip
 //!     only_cwds = []           # if non-empty, resume only under these prefixes
@@ -71,7 +75,7 @@ struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            delay_seconds: 5,
+            delay_seconds: 10,
             stagger_seconds: 2,
             ignore_cwds: Vec::new(),
             only_cwds: Vec::new(),
@@ -504,6 +508,58 @@ fn session_display_name(session: &MuseSession) -> &str {
     session.session_name.as_deref().unwrap_or("None")
 }
 
+// How often to re-read a pane while waiting for its shell to settle.
+const READY_POLL_MS: u64 = 200;
+// How many recent rows to compare; the prompt lives at the bottom.
+const READY_PANE_LINES: &str = "20";
+
+/// Recent plain-text output of a pane (bottom rows only).
+fn pane_read_text(pane_id: &str) -> Result<String, String> {
+    run_herdr(&[
+        "pane".to_string(),
+        "read".to_string(),
+        "--lines".to_string(),
+        READY_PANE_LINES.to_string(),
+        "--format".to_string(),
+        "text".to_string(),
+        pane_id.to_string(),
+    ])
+}
+
+/// True when a pane's output looks like a shell settled at a prompt:
+/// non-empty and unchanged since the previous sample. Prompt-agnostic on
+/// purpose: shells differ, but a ready shell stops printing.
+fn is_settled(previous: Option<&str>, current: &str) -> bool {
+    !current.trim().is_empty() && previous == Some(current)
+}
+
+/// Poll `sample` every `interval` until the output settles (see
+/// `is_settled`) or `max_waits` sleeps elapse. Failed samples (None) never
+/// settle but don't reset the previous sample either. Returns true when
+/// settled, false on cap exhaustion.
+fn wait_until_settled(
+    sample: &mut dyn FnMut() -> Option<String>,
+    sleep: &mut dyn FnMut(Duration),
+    max_waits: u32,
+    interval: Duration,
+) -> bool {
+    let mut previous: Option<String> = None;
+    let mut waits = 0u32;
+    loop {
+        if let Some(current) = sample() {
+            if is_settled(previous.as_deref(), &current) {
+                return true;
+            }
+            previous = Some(current);
+        }
+        if waits >= max_waits {
+            return false;
+        }
+        sleep(interval);
+        waits += 1;
+    }
+}
+
 fn run(argv: Vec<String>) -> i32 {
     let mut cfg = load_config();
     let mut only_pane: Option<String> = None;
@@ -529,13 +585,10 @@ fn run(argv: Vec<String>) -> i32 {
         }
     }
 
-    let delay = cfg.delay_seconds.max(0);
-    if delay > 0 && only_pane.is_none() {
-        log(&format!(
-            "waiting {delay}s for restored shells to reach a prompt..."
-        ));
-        thread::sleep(Duration::from_secs(delay as u64));
-    }
+    // Max seconds to wait per pane for its shell to settle at a prompt.
+    // Unlike the old fixed pre-sleep, each pane proceeds as soon as its own
+    // output stabilizes, so fast shells resume immediately.
+    let ready_cap_secs = cfg.delay_seconds.max(0);
 
     let panes = match list_panes() {
         Ok(p) => p,
@@ -619,6 +672,22 @@ fn run(argv: Vec<String>) -> i32 {
         for (_, pane_id) in plan {
             let session = &assignments[&pane_id];
             let pane = eligible.iter().find(|p| p.pane_id == pane_id).unwrap();
+            if only_pane.is_none() && ready_cap_secs > 0 {
+                let mut sampler = || pane_read_text(&pane_id).ok();
+                let mut sleeper = |d: Duration| thread::sleep(d);
+                let max_waits = (ready_cap_secs as u64 * 1000 / READY_POLL_MS) as u32;
+                let settled = wait_until_settled(
+                    &mut sampler,
+                    &mut sleeper,
+                    max_waits,
+                    Duration::from_millis(READY_POLL_MS),
+                );
+                if !settled {
+                    log(&format!(
+                        "WARNING: {pane_id} shell not settled after {ready_cap_secs}s, resuming anyway"
+                    ));
+                }
+            }
             let cmd = format!("muse resume {}", session.session_id);
             let args = vec![
                 "pane".to_string(),
@@ -887,5 +956,107 @@ mod tests {
         fs::write(&path, "{not json").unwrap();
         assert!(load_mapping(&path.to_string_lossy()).is_empty());
         fs::remove_dir_all(&tmp).unwrap();
+    }
+
+    #[test]
+    fn settled_needs_two_identical_nonempty_samples() {
+        assert!(!is_settled(None, "$ "));
+        assert!(is_settled(Some("$ "), "$ "));
+        assert!(!is_settled(Some("$ "), "$ % "));
+    }
+
+    #[test]
+    fn settled_rejects_empty_output() {
+        // A pane that prints nothing (shell not started yet) is never ready,
+        // even when consecutive samples agree.
+        assert!(!is_settled(None, ""));
+        assert!(!is_settled(Some(""), ""));
+        assert!(!is_settled(Some("  \n "), "  \n "));
+    }
+
+    /// Scripted sampler/sleeper for wait_until_settled tests.
+    fn scripted(
+        outputs: Vec<Option<&str>>,
+    ) -> (
+        impl FnMut() -> Option<String>,
+        impl Fn() -> usize,
+        impl FnMut(Duration),
+    ) {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+        let outputs: Vec<Option<String>> =
+            outputs.into_iter().map(|o| o.map(str::to_string)).collect();
+        let outputs = Rc::new(RefCell::new(outputs.into_iter()));
+        let sleeps = Rc::new(RefCell::new(0usize));
+        let sampler = {
+            let outputs = Rc::clone(&outputs);
+            move || outputs.borrow_mut().next().unwrap_or(None)
+        };
+        let sleep_count = {
+            let sleeps = Rc::clone(&sleeps);
+            move || *sleeps.borrow()
+        };
+        let sleeper = {
+            let sleeps = Rc::clone(&sleeps);
+            move |_: Duration| *sleeps.borrow_mut() += 1
+        };
+        (sampler, sleep_count, sleeper)
+    }
+
+    #[test]
+    fn wait_settles_on_second_identical_sample() {
+        let (mut sampler, sleep_count, mut sleeper) = scripted(vec![Some("$ "), Some("$ ")]);
+        assert!(wait_until_settled(
+            &mut sampler,
+            &mut sleeper,
+            50,
+            Duration::from_millis(200)
+        ));
+        assert_eq!(sleep_count(), 1);
+    }
+
+    #[test]
+    fn wait_settles_after_changing_output() {
+        let (mut sampler, sleep_count, mut sleeper) =
+            scripted(vec![Some(""), Some("loading..."), Some("$ "), Some("$ ")]);
+        assert!(wait_until_settled(
+            &mut sampler,
+            &mut sleeper,
+            50,
+            Duration::from_millis(200)
+        ));
+        assert_eq!(sleep_count(), 3);
+    }
+
+    #[test]
+    fn wait_tolerates_failed_samples() {
+        // Read errors (None) neither settle nor reset the previous sample.
+        let (mut sampler, _, mut sleeper) = scripted(vec![Some("$ "), None, Some("$ ")]);
+        assert!(wait_until_settled(
+            &mut sampler,
+            &mut sleeper,
+            50,
+            Duration::from_millis(200)
+        ));
+    }
+
+    #[test]
+    fn wait_gives_up_at_cap() {
+        // Ever-changing output exhausts the cap and reports not settled,
+        // sleeping exactly max_waits times (no trailing sleep).
+        let mut n = 0;
+        let mut sampler = move || {
+            n += 1;
+            Some(format!("tick {n}"))
+        };
+        let mut sleeps = 0;
+        let mut sleeper = |_: Duration| sleeps += 1;
+        assert!(!wait_until_settled(
+            &mut sampler,
+            &mut sleeper,
+            4,
+            Duration::from_millis(200)
+        ));
+        assert_eq!(sleeps, 4);
     }
 }
